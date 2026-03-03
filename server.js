@@ -1,7 +1,7 @@
-const express    = require('express');
-const cors       = require('cors');
-const { createClient, TransactionStatus } = require('genlayer-js');
-const { privateKeyToAccount } = require('genlayer-js/accounts');
+import express from 'express';
+import cors from 'cors';
+import { createClient } from 'genlayer-js';
+import { privateKeyToAccount } from 'genlayer-js/accounts';
 
 const app  = express();
 const PORT = process.env.PORT || 3003;
