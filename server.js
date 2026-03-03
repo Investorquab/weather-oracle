@@ -7,7 +7,7 @@ const app  = express();
 const PORT = process.env.PORT || 3003;
 
 const PRIVATE_KEY       = process.env.OPERATOR_PRIVATE_KEY;
-const CONTRACT_ADDRESS  = process.env.CONTRACT_ADDRESS || '';
+const CONTRACT_ADDRESS  = process.env.CONTRACT_ADDRESS || '0x59D9D2c4920527CE1337b82C9fDC5e776e2615A3';
 
 app.use(cors());
 app.use(express.json());
