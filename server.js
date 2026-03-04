@@ -2,13 +2,15 @@ import express from 'express';
 import cors from 'cors';
 import { createClient, createAccount } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
+import { TransactionStatus } from 'genlayer-js/types';
 
 const OPERATOR_KEY     = process.env.OPERATOR_PRIVATE_KEY || '0xa7db0893b5433f384c92669e3d54b7106e069a8d3cff415ee31affebdfa6b0bc';
 const DEFAULT_CONTRACT = process.env.CONTRACT_ADDRESS || '0x59D9D2c4920527CE1337b82C9fDC5e776e2615A3';
 const PORT             = process.env.PORT || 3003;
 
 const app = express();
-app.use(cors({ origin: '*' }));
+app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type'] }));
+app.options('*', cors());
 app.use(express.json());
 
 let client = null;
@@ -29,56 +31,71 @@ async function initializeClient() {
   }
 }
 
-async function waitForTx(hash, label) {
-  const MAX = 24;
-  for (let i = 0; i < MAX; i++) {
-    await sleep(5000);
+async function callContract(contractAddress, functionName, args = []) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const receipt = await client.waitForTransactionReceipt({ hash, retries: 1 });
-      if (receipt) {
-        console.log('✅ Done:', label);
-        // Try to parse result
-        const raw = JSON.stringify(receipt);
-        const match = raw.match(/"(\{[^"]*"success"[^"]*\})"/);
-        if (match) {
-          try {
-            const parsed = JSON.parse(match[1].replace(/\\"/g, '"').replace(/\\n/g, ''));
-            console.log('📦 parsed:', JSON.stringify(parsed).substring(0,100));
-            return { success: true, data: parsed };
-          } catch(e) {}
-        }
-        // Try eq_outputs
-        if (receipt.consensus_data) {
-          const cd = receipt.consensus_data;
-          const leader = cd.final_used_leader_receipt || cd.leader_receipt;
-          if (leader?.execution_result) {
-            try {
-              const parsed = typeof leader.execution_result === 'string'
-                ? JSON.parse(leader.execution_result)
-                : leader.execution_result;
-              return { success: true, data: parsed };
-            } catch(e) {}
-          }
-        }
-        return { success: false, error: 'Finalized but could not parse' };
-      }
-    } catch(e) {
-      if (i < MAX - 1) continue;
+      console.log(`📝 ${functionName} (attempt ${attempt})`);
+      const txHash = await client.writeContract({
+        address: contractAddress, functionName, args, value: 0n, leaderOnly: true,
+      });
+      console.log('⏳ Waiting...', txHash);
+      const receipt = await client.waitForTransactionReceipt({
+        hash: txHash, status: TransactionStatus.ACCEPTED, retries: 30, interval: 3000,
+      });
+      console.log('✅ Done:', functionName);
+      return receipt;
+    } catch(err) {
+      console.log(`Attempt ${attempt} failed: ${err.message.slice(0,80)}`);
+      if (attempt < 3) await sleep(4000);
+      else throw err;
     }
   }
-  return { success: false, error: 'Timeout' };
 }
 
-// ── ROUTES ────────────────────────────────────
+function extractResult(receipt) {
+  try {
+    const lr = receipt?.consensus_data?.leader_receipt?.[0];
+
+    // 1. readable
+    const readable = lr?.result?.payload?.readable;
+    if (readable) {
+      console.log('📦 readable raw:', String(readable).slice(0, 200));
+      let str = readable;
+      if (typeof str === 'string' && str.startsWith('"') && str.endsWith('"')) str = str.slice(1,-1);
+      str = str.replace(/\\"/g, '"').replace(/\\n/g, '').replace(/\\t/g, '');
+      try { const r = JSON.parse(str); console.log('✅ Parsed from readable'); return r; } catch(e) {}
+      try { const r = JSON.parse(readable); return r; } catch(e) {}
+    }
+
+    // 2. stdout
+    const stdout = lr?.genvm_result?.stdout;
+    if (stdout?.trim()) {
+      try { const r = JSON.parse(stdout.trim()); console.log('✅ Parsed from stdout'); return r; } catch(e) {}
+    }
+
+    // 3. eq_outputs
+    const eq = lr?.eq_outputs;
+    if (eq && Object.keys(eq).length > 0) {
+      const first = Object.values(eq)[0];
+      try { const r = JSON.parse(first); console.log('✅ Parsed from eq_outputs'); return r; } catch(e) {}
+    }
+
+    console.log('⚠️ Full lr keys:', Object.keys(lr || {}));
+    console.log('⚠️ lr.result:', JSON.stringify(lr?.result)?.slice(0, 200));
+    return null;
+  } catch(e) {
+    return null;
+  }
+}
+
+// ── LIVE WEATHER (Open-Meteo) ─────────────────
+const geoCache = {};
+const wxCache  = {};
+const TTL      = 5 * 60 * 1000;
 
 app.get('/health', (req, res) => {
   res.json({ status: 'alive', service: 'GenLayer Weather Oracle', port: PORT });
 });
-
-// Live weather via Open-Meteo (free, no API key)
-const geoCache = {};
-const wxCache  = {};
-const TTL      = 5 * 60 * 1000;
 
 app.get('/api/live-weather', async (req, res) => {
   const city = req.query.city;
@@ -113,14 +130,14 @@ app.get('/api/live-weather', async (req, res) => {
     const daily = wj.daily;
 
     function codeToCondition(code) {
-      if (code === 0)    return { label: 'Sunny',         code: 'sunny'         };
-      if (code <= 2)     return { label: 'Partly Cloudy', code: 'partly_cloudy' };
-      if (code === 3)    return { label: 'Overcast',      code: 'cloudy'        };
-      if (code <= 49)    return { label: 'Foggy',         code: 'foggy'         };
-      if (code <= 67)    return { label: 'Rainy',         code: 'rainy'         };
-      if (code <= 77)    return { label: 'Snowy',         code: 'snowy'         };
-      if (code <= 82)    return { label: 'Rainy',         code: 'rainy'         };
-      if (code <= 99)    return { label: 'Thunderstorm',  code: 'thunderstorm'  };
+      if (code === 0)  return { label: 'Sunny',         code: 'sunny'         };
+      if (code <= 2)   return { label: 'Partly Cloudy', code: 'partly_cloudy' };
+      if (code === 3)  return { label: 'Overcast',      code: 'cloudy'        };
+      if (code <= 49)  return { label: 'Foggy',         code: 'foggy'         };
+      if (code <= 67)  return { label: 'Rainy',         code: 'rainy'         };
+      if (code <= 77)  return { label: 'Snowy',         code: 'snowy'         };
+      if (code <= 82)  return { label: 'Rainy',         code: 'rainy'         };
+      if (code <= 99)  return { label: 'Thunderstorm',  code: 'thunderstorm'  };
       return { label: 'Cloudy', code: 'cloudy' };
     }
 
@@ -136,14 +153,13 @@ app.get('/api/live-weather', async (req, res) => {
     const forecast = (daily.time || []).slice(0, 5).map((_, i) => {
       const fc = codeToCondition(daily.weather_code[i]);
       return {
-        day:          days[i] || 'Day ' + (i+1),
-        high_c:       Math.round(daily.temperature_2m_max[i]),
-        low_c:        Math.round(daily.temperature_2m_min[i]),
-        high_f:       Math.round(daily.temperature_2m_max[i] * 9/5 + 32),
-        low_f:        Math.round(daily.temperature_2m_min[i] * 9/5 + 32),
-        condition:    fc.label,
-        condition_code: fc.code,
-        rain_chance:  daily.precipitation_probability_max[i] || 0,
+        day: days[i] || 'Day '+(i+1),
+        high_c: Math.round(daily.temperature_2m_max[i]),
+        low_c:  Math.round(daily.temperature_2m_min[i]),
+        high_f: Math.round(daily.temperature_2m_max[i] * 9/5 + 32),
+        low_f:  Math.round(daily.temperature_2m_min[i] * 9/5 + 32),
+        condition: fc.label, condition_code: fc.code,
+        rain_chance: daily.precipitation_probability_max[i] || 0,
       };
     });
 
@@ -154,12 +170,12 @@ app.get('/api/live-weather', async (req, res) => {
       wind_mph: windMph, wind_kph: windKph,
       condition: cond.label, condition_code: cond.code,
       uv_index: cur.uv_index || 0,
-      visibility_km: cur.visibility ? Math.round(cur.visibility / 1000) : 10,
+      visibility_km: cur.visibility ? Math.round(cur.visibility/1000) : 10,
       forecast,
     };
 
     wxCache[key] = { data: weather, ts: Date.now() };
-    console.log('✅ Live weather:', resolvedCity, tempC + '°C', cond.label);
+    console.log('✅ Live weather:', resolvedCity, tempC+'°C', cond.label);
     res.json({ success: true, weather });
   } catch(err) {
     console.log('❌ Weather error:', err.message);
@@ -172,12 +188,10 @@ app.post('/api/get-weather', async (req, res) => {
   const ca = contract || DEFAULT_CONTRACT;
   console.log('🌤️ get_weather(' + city + ') via contract', ca.slice(0,10) + '...');
   try {
-    const hash = await client.writeContract({
-      address: ca, functionName: 'get_weather', args: [city], value: 0n,
-    });
-    console.log('⏳ Waiting...', hash);
-    const result = await waitForTx(hash, 'get_weather');
-    res.json(result);
+    const receipt = await callContract(ca, 'get_weather', [city]);
+    const data    = extractResult(receipt);
+    if (data) return res.json({ success: true, data });
+    res.json({ success: false, error: 'Could not parse contract result' });
   } catch(err) {
     res.json({ success: false, error: err.message });
   }
@@ -188,12 +202,10 @@ app.post('/api/record-weather', async (req, res) => {
   const ca = contract || DEFAULT_CONTRACT;
   console.log('📌 record_weather(' + city + ')...');
   try {
-    const hash = await client.writeContract({
-      address: ca, functionName: 'record_weather', args: [city], value: 0n,
-    });
-    console.log('⏳ Waiting...', hash);
-    const result = await waitForTx(hash, 'record_weather');
-    res.json(result);
+    const receipt = await callContract(ca, 'record_weather', [city]);
+    const data    = extractResult(receipt);
+    if (data) return res.json({ success: true, data });
+    res.json({ success: false, error: 'Could not parse contract result' });
   } catch(err) {
     res.json({ success: false, error: err.message });
   }
@@ -212,9 +224,8 @@ app.get('/api/weather-history', async (req, res) => {
   }
 });
 
-// Start
 const ok = await initializeClient();
-if (!ok) { console.error('Failed to connect. Exiting.'); process.exit(1); }
+if (!ok) { process.exit(1); }
 app.listen(PORT, () => {
   console.log('✅ Weather Oracle Backend running on port', PORT);
   console.log('📌 Health: http://localhost:' + PORT + '/health');
