@@ -40,7 +40,7 @@ async function callContract(contractAddress, functionName, args = []) {
       });
       console.log('⏳ Waiting...', txHash);
       const receipt = await client.waitForTransactionReceipt({
-        hash: txHash, status: TransactionStatus.ACCEPTED, retries: 30, interval: 3000,
+        hash: txHash, status: TransactionStatus.FINALIZED, retries: 40, interval: 5000,
       });
       console.log('✅ Done:', functionName);
       return receipt;
